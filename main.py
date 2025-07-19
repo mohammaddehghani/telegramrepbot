@@ -4,20 +4,27 @@ import psycopg2
 import datetime
 import jdatetime
 import openpyxl
-from dotenv import load_dotenv
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, InputFile,
 )
 from telegram.ext import (
     Application, ContextTypes, CommandHandler, CallbackQueryHandler,
 )
+import pytz
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-SUPER_ADMIN = int(os.getenv("SUPER_ADMIN"))
+# خواندن پارامترها از محیط (نیازی به dotenv نیست)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+SUPER_ADMIN = os.environ.get("SUPER_ADMIN")
+
+if not BOT_TOKEN or not DATABASE_URL or not SUPER_ADMIN:
+    raise Exception(
+        "متغیرهای محیطی BOT_TOKEN و DATABASE_URL و SUPER_ADMIN را در پنل لیارا تعریف کنید."
+    )
+
+SUPER_ADMIN = int(SUPER_ADMIN)
 
 ####=== DATABASE ===####
 def get_db():
@@ -94,8 +101,6 @@ def fetch_attendance(user_id=None, start=None, end=None):
     return result
 
 ####=== JALALI & TEHRAN TIME ===####
-import pytz
-
 def get_iran_now():
     return datetime.datetime.now(pytz.timezone('Asia/Tehran'))
 
@@ -223,7 +228,7 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("فرمت:\n/report_month user_id")
     elif query.data == 'admin_backup':
         await query.message.reply_text("دریافت کل خروجی اکسل و فایل متنی ادمین‌ها/کاربران.\nفرمت:\n/backup")
-        
+
 async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("دسترسی فقط برای ادمین‌ها.")
@@ -248,6 +253,7 @@ async def report_month_command(update: Update, context: ContextTypes.DEFAULT_TYP
         items = fetch_attendance(user_id=user_id, start=start, end=end)
         if not items:
             await update.message.reply_text("بدون داده.")
+            return
         out = [f"گزارش ماه جاری ({get_display_name(user_id)}):"]
         for it in items:
             shdate, shtime = to_shamsi(it[2])
@@ -293,7 +299,6 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=InputFile(xlsx), filename="all_attendance.xlsx")
     await update.message.reply_document(document=InputFile(txt), filename="users_admins.txt")
     await update.message.reply_text("بکاپ کامل ارسال شد ✅")
-
 
 ####=== SETUP APP ===####
 def main():
