@@ -28,7 +28,10 @@ SUPER_ADMIN = int(SUPER_ADMIN)
 
 ####=== DATABASE ===####
 def get_db():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return psycopg2.connect(DATABASE_URL, sslmode="disable")
+
+#def get_db():
+#    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def ensure_user(user):
     conn = get_db(); cur = conn.cursor()
