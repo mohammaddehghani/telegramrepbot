@@ -1,6 +1,13 @@
-python-telegram-bot==20.8
-psycopg2-binary==2.9.9
+# فایل requirements.txt
+
+# تلگرام بات (نسخه 20+)
+python-telegram-bot>=20.0
+
+# اتصال PostgreSQL
+psycopg2-binary
+
+# تولید گزارش اکسل
 openpyxl
+
+# تبدیل تاریخ به شمسی
 jdatetime
-python-dotenv
-pytz
