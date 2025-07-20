@@ -24,7 +24,7 @@ SUPER_ADMIN = int(os.getenv("SUPER_ADMIN"))
 
 # -- ساخت جداول اگر نبودند
 def get_db():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return psycopg2.connect(DATABASE_URL, sslmode="disable")
 
 def ensure_db_tables():
     conn = get_db()
