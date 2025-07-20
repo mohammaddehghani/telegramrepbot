@@ -39,7 +39,7 @@ SUPER_ADMIN = int(os.getenv("SUPER_ADMIN", 0))
 ) = range(4)
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return psycopg2.connect(DATABASE_URL, sslmode="disable")
 
 def ensure_user(user):
     conn = get_db()
