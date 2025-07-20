@@ -1,13 +1,7 @@
 # requirements.txt (نسخه جدید)
-
-# کتابخانه‌ی اصلی تلگرام بات (نسخه 20 به بالا)
-python-telegram-bot>=20.0
-
-# برای اتصال به PostgreSQL را بدون نیاز به تنظیمات اضافی استفاده می‌کنیم
-psycopg2-binary
-
-# زمانی که از فایل Excel استفاده می‌کنیم (برای گزارشات و بکاپ)
-openpyxl
-
-# تبدیل تاریخ‌های شمسی (جِ دِیتتایم)
-jdatetime
+python-telegram-bot==20.7
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+openpyxl>=3.1.2
+jdatetime>=4.1.0
+pytz
