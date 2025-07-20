@@ -4,152 +4,130 @@ import psycopg2
 import datetime
 import jdatetime
 import openpyxl
-import pytz
+
 from dotenv import load_dotenv
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, InputFile
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InputFile,
 )
 from telegram.ext import (
-    Application, ContextTypes, CommandHandler, CallbackQueryHandler
+    Application,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    filters,
 )
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not os.getenv("SUPER_ADMIN") or not os.getenv("SUPER_ADMIN").isdigit():
-    raise Exception("SUPER_ADMIN باید به صورت یک عدد صحیح ست شود و در env قرار بگیرد.")
+BOT_TOKEN   = os.getenv("BOT_TOKEN")
+DATABASE_URL= os.getenv("DATABASE_URL")
 SUPER_ADMIN = int(os.getenv("SUPER_ADMIN"))
 
-# -- ساخت جداول اگر نبودند
+# حالت‌های ConversationHandler
+(
+    USER_MONTH,
+    ADMIN_MONTH_ALL,
+    ADMIN_SET_NAME,
+    ADMIN_ADD_REMOVE,
+) = range(4)
+
+# ==== DATABASE HELPERS ====
 def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="disable")
 
-def ensure_db_tables():
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            display_name TEXT
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS attendance (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT REFERENCES users(user_id),
-            status TEXT,
-            timestamp TIMESTAMPTZ DEFAULT now()
-        );""")
-        conn.commit()
-    finally:
-        cur.close(); conn.close()
-
-ensure_db_tables()
-
-# --- توابع دیتابیس ---
 def ensure_user(user):
+    """در صورت جدید بودن کاربر در جدول users، یه employee_id اختصاص بده."""
     conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO users (user_id, full_name, username, display_name) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id) DO NOTHING;",
-            (user.id, f"{user.first_name or ''} {user.last_name or ''}".strip(), user.username or '', f"{user.first_name or ''} {user.last_name or ''}".strip())
-        )
+    # ۱. ببین کاربر قبلاً هست یا نه
+    cur.execute("SELECT employee_id FROM users WHERE user_id=%s;", (user.id,))
+    row = cur.fetchone()
+    if not row:
+        # شناسه ماکسیمم فعلی را بگیر
+        cur.execute("SELECT MAX(employee_id) FROM users;")
+        mx = cur.fetchone()[0]
+        next_id = int(mx) + 1 if mx else 1
+        emp_id = f"{next_id:04d}"
+        # درج رکورد جدید
+        cur.execute("""
+            INSERT INTO users (user_id, full_name, username, display_name, employee_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO NOTHING;
+        """, (
+            user.id,
+            f"{user.first_name or ''} {user.last_name or ''}".strip(),
+            user.username or '',
+            f"{user.first_name or ''}".strip(),
+            emp_id
+        ))
         conn.commit()
-    finally:
-        cur.close(); conn.close()
+    cur.close(); conn.close()
 
 def add_admin(user_id):
     conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT DO NOTHING;", (user_id,))
-        conn.commit()
-    finally:
-        cur.close(); conn.close()
+    cur.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT DO NOTHING;", (user_id,))
+    conn.commit(); cur.close(); conn.close()
 
 def is_admin(user_id):
-    if user_id == SUPER_ADMIN:
-        return True
     conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT 1 FROM admins WHERE user_id = %s;", (user_id,))
-        res = cur.fetchone()
-        return (res is not None)
-    finally:
-        cur.close(); conn.close()
-
-def list_admins():
-    conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM admins;")
-        return [row[0] for row in cur.fetchall()]
-    finally:
-        cur.close(); conn.close()
+    cur.execute("SELECT 1 FROM admins WHERE user_id=%s;", (user_id,))
+    ok = cur.fetchone() is not None
+    cur.close(); conn.close()
+    return user_id == SUPER_ADMIN or ok
 
 def list_users():
     conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id, full_name, username, display_name FROM users ORDER BY user_id;")
-        return cur.fetchall()
-    finally:
-        cur.close(); conn.close()
+    cur.execute("SELECT user_id, full_name, username, display_name, employee_id FROM users ORDER BY user_id;")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def list_admins():
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT user_id FROM admins;")
+    rows = [r[0] for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
 
 def set_display_name(user_id, new_name):
     conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE users SET display_name=%s WHERE user_id=%s;", (new_name, user_id))
-        conn.commit()
-    finally:
-        cur.close(); conn.close()
+    cur.execute("UPDATE users SET display_name=%s WHERE user_id=%s;", (new_name, user_id))
+    conn.commit(); cur.close(); conn.close()
 
 def save_attendance(user_id, status):
     conn = get_db(); cur = conn.cursor()
-    try:
-        now = get_iran_now()
-        cur.execute("INSERT INTO attendance (user_id, status, timestamp) VALUES (%s, %s, %s);", (user_id, status, now))
-        conn.commit()
-    finally:
-        cur.close(); conn.close()
+    now = get_iran_now()
+    cur.execute(
+        "INSERT INTO attendance (user_id, status, timestamp) VALUES (%s,%s,%s);",
+        (user_id, status, now)
+    )
+    conn.commit(); cur.close(); conn.close()
 
 def fetch_attendance(user_id=None, start=None, end=None):
     conn = get_db(); cur = conn.cursor()
-    try:
-        q = "SELECT user_id, status, timestamp FROM attendance"
-        p = []
-        have_where = False
-        if user_id is not None:
-            q += " WHERE user_id=%s"
-            p.append(user_id)
-            have_where = True
-        if start:
-            if have_where:
-                q += " AND"
-            else:
-                q += " WHERE"
-                have_where = True
-            q += " timestamp >= %s"
-            p.append(start)
-        if end:
-            if have_where:
-                q += " AND"
-            else:
-                q += " WHERE"
-            q += " timestamp <= %s"
-            p.append(end)
-        q += " ORDER BY timestamp"
-        cur.execute(q, tuple(p))
-        return cur.fetchall()
-    finally:
-        cur.close(); conn.close()
+    q = "SELECT user_id, status, timestamp FROM attendance"
+    params = []
+    clauses = []
+    if user_id is not None:
+        clauses.append("user_id=%s"); params.append(user_id)
+    if start is not None:
+        clauses.append("timestamp>=%s"); params.append(start)
+    if end is not None:
+        clauses.append("timestamp<=%s"); params.append(end)
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY timestamp"
+    cur.execute(q, tuple(params))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
 
-# --- مدیریت زمان ایران و تاریخ شمسی
+# ==== زمان ایران و تبدیل شمسی ====
+import pytz
 def get_iran_now():
     return datetime.datetime.now(pytz.timezone('Asia/Tehran'))
 
@@ -158,204 +136,262 @@ def to_shamsi(dateobj):
     return s.strftime('%Y/%m/%d'), s.strftime('%H:%M:%S')
 
 def get_display_name(user_id):
-    users = list_users()
-    for u in users:
+    for u in list_users():
         if u[0] == user_id:
-            return u[3] or u[1] or str(user_id)
+            return u[3] or u[1] or u[4] or str(user_id)
     return str(user_id)
 
-# --- فرمان‌ها
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==== کیبوردهای دائمی ====
+def main_menu_keyboard():
+    kb = [
+        ['ثبت ورود', 'ثبت خروج'],
+        ['گزارش روزانه', 'گزارش ماهانه من'],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def admin_menu_keyboard():
+    kb = [
+        ['لیست کاربران', 'تعیین نام نمایشی'],
+        ['گزارش روزانه همه', 'گزارش ماهانه همه'],
+        ['دریافت بکاپ اکسل', 'بازگشت']
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+# ==== HANDLERS اصلی ====
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     add_admin(SUPER_ADMIN)
-    await update.message.reply_text('سلام! برای ثبت حضور یا دریافت گزارش‌ها از دکمه‌های زیر استفاده کنید.', reply_markup=main_menu())
+    await update.message.reply_text(
+        'سلام! از دکمه‌های زیر استفاده کنید.',
+        reply_markup=main_menu_keyboard()
+    )
 
-def main_menu():
-    keyboard = [
-        [InlineKeyboardButton("ثبت ورود", callback_data='enter')],
-        [InlineKeyboardButton("ثبت خروج", callback_data='exit')],
-        [InlineKeyboardButton("گزارش روزانه", callback_data='my_daily')],
-        [InlineKeyboardButton("گزارش ماهانه", callback_data='my_monthly')],
-        [InlineKeyboardButton("ادمین", callback_data='admin')],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    user_id = update.effective_user.id
+    ensure_user(update.effective_user)
 
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ensure_user(query.from_user)
-    if query.data == 'enter':
-        save_attendance(query.from_user.id, 'enter')
-        await query.delete_message()
-        await query.message.reply_text("✅ | ورود ثبت شد.")
-    elif query.data == 'exit':
-        save_attendance(query.from_user.id, 'exit')
-        await query.delete_message()
-        await query.message.reply_text("✅ | خروج ثبت شد.")
-    elif query.data == 'my_daily':
-        await query.delete_message()
-        await send_report(query, context, period='day', user_id=query.from_user.id)
-    elif query.data == 'my_monthly':
-        await query.delete_message()
-        await send_report(query, context, period='month', user_id=query.from_user.id)
-    elif query.data == 'admin':
-        if is_admin(query.from_user.id):
-            await query.delete_message()
-            await admin_menu(query, context)
+    # --- غیر ادمین ---
+    if txt == 'ثبت ورود':
+        save_attendance(user_id, 'enter')
+        await update.message.reply_text("✅ ورود ثبت شد.", reply_markup=main_menu_keyboard())
+    elif txt == 'ثبت خروج':
+        save_attendance(user_id, 'exit')
+        await update.message.reply_text("✅ خروج ثبت شد.", reply_markup=main_menu_keyboard())
+    elif txt == 'گزارش روزانه':
+        await send_report(update, ctx, 'day', user_id)
+    elif txt == 'گزارش ماهانه من':
+        # شروع Conversation برای ماه کاربر
+        await update.message.reply_text(
+            "لطفاً ماه و سال را به صورت YYYY/MM وارد کنید یا 'بازگشت' برای انصراف.",
+            reply_markup=ReplyKeyboardMarkup([['بازگشت']], resize_keyboard=True)
+        )
+        return USER_MONTH
+
+    # --- ادمین ---
+    elif txt == 'لیست کاربران' and is_admin(user_id):
+        lines = ["ID  │  نام نمایش  │ emp_id  │ @username"]
+        for u in list_users():
+            lines.append(f"{u[0]} │ {u[3]} │ {u[4]} │ @{u[2]}")
+        await update.message.reply_text('\n'.join(lines), reply_markup=admin_menu_keyboard())
+
+    elif txt == 'تعیین نام نمایشی' and is_admin(user_id):
+        await update.message.reply_text(
+            "لطفاً ابتدا ID کاربر را وارد کنید یا 'بازگشت'.",
+            reply_markup=ReplyKeyboardMarkup([['بازگشت']], resize_keyboard=True)
+        )
+        return ADMIN_SET_NAME
+
+    elif txt == 'گزارش روزانه همه' and is_admin(user_id):
+        await send_report(update, ctx, 'day', None, all_users=True)
+
+    elif txt == 'گزارش ماهانه همه' and is_admin(user_id):
+        await update.message.reply_text(
+            "ماه و سال را به صورت YYYY/MM وارد کنید یا 'بازگشت'.",
+            reply_markup=ReplyKeyboardMarkup([['بازگشت']], resize_keyboard=True)
+        )
+        return ADMIN_MONTH_ALL
+
+    elif txt == 'دریافت بکاپ اکسل' and is_admin(user_id):
+        # بکاپ کلی
+        xlsx = create_total_attendance_excel()
+        await update.message.reply_document(
+            document=InputFile(xlsx), filename="all_attendance.xlsx"
+        )
+        await update.message.reply_text("✅ بکاپ ارسال شد.", reply_markup=admin_menu_keyboard())
+
+    elif txt == 'بازگشت':
+        # بازگشت به منوی اصلی یا ادمین
+        if is_admin(user_id):
+            await update.message.reply_text("پنل ادمین:", reply_markup=admin_menu_keyboard())
         else:
-            await query.answer("دسترسی فقط برای ادمین.")
+            await update.message.reply_text("منوی اصلی:", reply_markup=main_menu_keyboard())
 
-async def send_report(query, context, period, user_id):
-    now = get_iran_now()
-    start, end = None, None
-    if period == 'day':
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now.replace(hour=23, minute=59, second=59)
-        title = "گزارش روزانه"
-    elif period == 'month':
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        end = now.replace(hour=23, minute=59, second=59)
-        title = "گزارش ماه جاری"
-    items = fetch_attendance(user_id=user_id, start=start, end=end)
-    if not items:
-        await query.message.reply_text(f"{title}\n📋 موردی ثبت نشده است.")
-        return
-    out = f"{title} ({get_display_name(user_id)})\n\n"
-    for it in items:
-        shdate, shtime = to_shamsi(it[2])
-        out += f"{shdate} - {shtime} | {'ورود' if it[1]=='enter' else 'خروج'}\n"
-    await query.message.reply_text(out)
+    else:
+        await update.message.reply_text("دستور نامعتبر. لطفاً از کیبورد استفاده کنید.")
 
-def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("لیست کاربران", callback_data='admin_users')],
-        [InlineKeyboardButton("تعیین نام نمایشی", callback_data='admin_setname')],
-        [InlineKeyboardButton("گزارش روزانه همه", callback_data='admin_daily_all')],
-        [InlineKeyboardButton("گزارش ماهانه کاربر", callback_data='admin_month_one')],
-        [InlineKeyboardButton("دریافت اکسل بکاپ", callback_data='admin_backup')],
-    ])
+    return ConversationHandler.END
 
-async def admin_menu(query, context):
-    await query.message.reply_text("پنل ادمین:", reply_markup=admin_keyboard())
+# ==== ConversationHandler callbacks ====
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("دسترسی فقط برای ادمین‌ها.")
-        return
-    await update.message.reply_text("پنل ادمین:", reply_markup=admin_keyboard())
-
-async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        await query.answer("دسترسی فقط برای ادمین")
-        return
-    if query.data == 'admin_users':
-        users = list_users()
-        users_txt = ["لیست کاربران:\n"]
-        for u in users:
-            users_txt.append(f"{u[0]}\t{u[3] or u[1]}\t@{u[2]}")
-        await query.message.reply_text("\n".join(users_txt))
-    elif query.data == 'admin_setname':
-        await query.message.reply_text("فرمت:\n /setname user_id نام جدید ")
-    elif query.data == 'admin_daily_all':
-        now = get_iran_now()
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now.replace(hour=23, minute=59, second=59)
-        allitems = fetch_attendance(start=start, end=end)
-        users = {u[0]: u for u in list_users()}
-        if not allitems:
-            await query.message.reply_text("گزارشی ثبت نشده.")
-            return
-        out = []
-        for it in allitems:
-            name = users[it[0]][3] or users[it[0]][1]
-            shdate, shtime = to_shamsi(it[2])
-            out.append(f"{name}: {shdate} {shtime} {'ورود' if it[1]=='enter' else 'خروج'}")
-        await query.message.reply_text('\n'.join(out))
-    elif query.data == 'admin_month_one':
-        await query.message.reply_text("فرمت:\n/report_month user_id")
-    elif query.data == 'admin_backup':
-        await query.message.reply_text("دریافت کل خروجی اکسل و فایل متنی ادمین‌ها/کاربران.\nفرمت:\n/backup")
-
-async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("دسترسی فقط برای ادمین‌ها.")
-        return
+async def user_month_cb(update: Update, ctx):
+    txt = update.message.text.strip()
+    if txt == 'بازگشت':
+        await update.message.reply_text("انصراف داده شد.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
     try:
-        user_id = int(context.args[0])
-        new_name = ' '.join(context.args[1:])
-        set_display_name(user_id, new_name)
-        await update.message.reply_text("نام داخلی کاربر تغییر کرد ✅")
-    except Exception:
-        await update.message.reply_text("فرمت صحیح: /setname user_id نام جدید")
-
-async def report_month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("دسترسی فقط برای ادمین‌ها.")
-        return
-    try:
-        user_id = int(context.args[0])
-        now = get_iran_now()
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        end = now.replace(hour=23, minute=59, second=59)
-        items = fetch_attendance(user_id=user_id, start=start, end=end)
-        if not items:
-            await update.message.reply_text("بدون داده.")
-        out = [f"گزارش ماه جاری ({get_display_name(user_id)}):"]
+        y, m = map(int, txt.split('/'))
+        start = datetime.datetime(y, m, 1, tzinfo=pytz.timezone('Asia/Tehran'))
+        # روز آخر ماه: با رفتن به ماه بعد منهای یک روز
+        if m == 12:
+            next_month = datetime.datetime(y+1, 1, 1, tzinfo=start.tzinfo)
+        else:
+            next_month = datetime.datetime(y, m+1, 1, tzinfo=start.tzinfo)
+        end = next_month - datetime.timedelta(seconds=1)
+        # گزارش اکسل خود کاربر
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(['تاریخ شمسی', 'ساعت', 'وضعیت'])
+        items = fetch_attendance(user_id=update.effective_user.id, start=start, end=end)
         for it in items:
-            shdate, shtime = to_shamsi(it[2])
-            out.append(f"{shdate} {shtime} {'ورود' if it[1]=='enter' else 'خروج'}")
-        await update.message.reply_text('\n'.join(out))
+            ds, ts = to_shamsi(it[2])
+            ws.append([ds, ts, 'ورود' if it[1]=='enter' else 'خروج'])
+        path = f"user_{update.effective_user.id}_{y}{m:02d}.xlsx"
+        wb.save(path)
+        await update.message.reply_document(
+            document=InputFile(path), filename=f"report_{y}_{m:02d}.xlsx"
+        )
     except Exception:
-        await update.message.reply_text("فرمت صحیح: /report_month user_id")
+        await update.message.reply_text("فرمت نادرست. لطفاً دوباره YYYY/MM وارد کنید یا 'بازگشت'.")
+        return USER_MONTH
 
+    await update.message.reply_text("✅ گزارش ماهانه ارسال شد.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+async def admin_month_all_cb(update: Update, ctx):
+    txt = update.message.text.strip()
+    if txt == 'بازگشت':
+        await update.message.reply_text("انصراف.", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
+    try:
+        y, m = map(int, txt.split('/'))
+        start = datetime.datetime(y, m, 1, tzinfo=pytz.timezone('Asia/Tehran'))
+        if m == 12:
+            next_month = datetime.datetime(y+1, 1, 1, tzinfo=start.tzinfo)
+        else:
+            next_month = datetime.datetime(y, m+1, 1, tzinfo=start.tzinfo)
+        end = next_month - datetime.timedelta(seconds=1)
+        # ساخت اکسل برای همه
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(['user_id','emp_id','نام نمایش','تاریخ شمسی','ساعت','وضعیت'])
+        users = {u[0]:u for u in list_users()}
+        items = fetch_attendance(start=start, end=end)
+        for it in items:
+            u = users[it[0]]
+            ds, ts = to_shamsi(it[2])
+            ws.append([
+                it[0], u[4], u[3],
+                ds, ts,
+                'ورود' if it[1]=='enter' else 'خروج'
+            ])
+        path = f"all_{y}{m:02d}.xlsx"
+        wb.save(path)
+        await update.message.reply_document(
+            document=InputFile(path), filename=f"all_report_{y}_{m:02d}.xlsx"
+        )
+    except Exception:
+        await update.message.reply_text("فرمت نادرست. دوباره YYYY/MM وارد کنید یا 'بازگشت'.")
+        return ADMIN_MONTH_ALL
+
+    await update.message.reply_text("✅ گزارش ماهانه همه ارسال شد.", reply_markup=admin_menu_keyboard())
+    return ConversationHandler.END
+
+async def admin_setname_cb(update: Update, ctx):
+    txt = update.message.text.strip()
+    if txt == 'بازگشت':
+        await update.message.reply_text("انصراف.", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
+    # اول پیام، user_id
+    if 'awaiting_user_id' not in ctx.user_data:
+        if txt.isdigit():
+            ctx.user_data['awaiting_user_id'] = int(txt)
+            await update.message.reply_text(
+                "حالا نام جدید را وارد کنید یا 'بازگشت'.",
+                reply_markup=ReplyKeyboardMarkup([['بازگشت']], resize_keyboard=True)
+            )
+        else:
+            await update.message.reply_text("فقط عدد ID را وارد کنید یا 'بازگشت'.")
+        return ADMIN_SET_NAME
+    else:
+        new_name = txt
+        uid = ctx.user_data.pop('awaiting_user_id')
+        set_display_name(uid, new_name)
+        await update.message.reply_text("✅ نام تغییر کرد.", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
+
+# ==== BACKUP کلی ====
 def create_total_attendance_excel():
-    filename = "/tmp/all_attendance.xlsx"
+    fn = "all_attendance.xlsx"
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(['user_id', 'نام داخلی', 'full_name', 'status', 'تاریخ شمسی', 'ساعت'])
-    allusers = {u[0]: u for u in list_users()}
-    allitems = fetch_attendance()
-    for it in allitems:
-        user = allusers.get(it[0])
-        display_name = user[3] if user else '-'
-        full_name = user[1] if user else '-'
-        shdate, shtime = to_shamsi(it[2])
-        ws.append([it[0], display_name, full_name, 'ورود' if it[1]=='enter' else 'خروج', shdate, shtime])
-    wb.save(filename)
-    return filename
+    ws.append(['user_id','emp_id','نام نمایش','full_name','تاریخ شمسی','ساعت','وضعیت'])
+    users = {u[0]:u for u in list_users()}
+    items = fetch_attendance()
+    for it in items:
+        u = users[it[0]]
+        ds, ts = to_shamsi(it[2])
+        ws.append([
+            it[0], u[4], u[3], u[1],
+            ds, ts,
+            'ورود' if it[1]=='enter' else 'خروج'
+        ])
+    wb.save(fn)
+    return fn
 
-def create_users_admins_txt():
-    filename = "/tmp/users_admins.txt"
-    with open(filename, "w", encoding="utf8") as f:
-        f.write("ادمین‌ها:\n")
-        for admin in list_admins():
-            f.write(str(admin) + "\n")
-        f.write("\nکاربران:\n")
-        for u in list_users():
-            f.write(f"{u[0]}\t{u[3] or u[1]}\t@{u[2]}\n")
-    return filename
-
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("دسترسی فقط برای ادمین‌ها.")
+# ==== گزارش متنی روزانه/عادی ====
+async def send_report(update, ctx, period, user_id, all_users=False):
+    now = get_iran_now()
+    if period == 'day':
+        start = now.replace(hour=0,minute=0,second=0,microsecond=0)
+        end   = now.replace(hour=23,minute=59,second=59)
+        title = "گزارش روزانه"
+    else:
         return
-    xlsx = create_total_attendance_excel()
-    txt = create_users_admins_txt()
-    await update.message.reply_document(document=InputFile(xlsx), filename="all_attendance.xlsx")
-    await update.message.reply_document(document=InputFile(txt), filename="users_admins.txt")
-    await update.message.reply_text("بکاپ کامل ارسال شد ✅")
+    items = (
+        fetch_attendance(start=start,end=end)
+        if all_users else
+        fetch_attendance(user_id=user_id,start=start,end=end)
+    )
+    if not items:
+        await update.message.reply_text("📋 موردی ثبت نشده.", reply_markup=(admin_menu_keyboard() if all_users else main_menu_keyboard()))
+        return
+    text = title+"\n\n"
+    users = {u[0]:u for u in list_users()}
+    for it in items:
+        name = users[it[0]][3]
+        ds, ts = to_shamsi(it[2])
+        text += f"{name} | {ds} {ts} | {'ورود' if it[1]=='enter' else 'خروج'}\n"
+    await update.message.reply_text(text, reply_markup=(admin_menu_keyboard() if all_users else main_menu_keyboard()))
+
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
+        states={
+            USER_MONTH:       [MessageHandler(filters.TEXT & ~filters.COMMAND, user_month_cb)],
+            ADMIN_MONTH_ALL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_month_all_cb)],
+            ADMIN_SET_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_setname_cb)],
+        },
+        fallbacks=[MessageHandler(filters.Regex('^بازگشت$'), handle_text)],
+        per_user=True
+    )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("setname", setname_command))
-    app.add_handler(CommandHandler("report_month", report_month_command))
-    app.add_handler(CommandHandler("backup", backup_command))
-    app.add_handler(CallbackQueryHandler(handle_buttons, pattern='^(enter|exit|my_daily|my_monthly|admin)$'))
-    app.add_handler(CallbackQueryHandler(admin_handler, pattern='^admin_'))
+    app.add_handler(conv)
+
     logging.info("Bot Started ...")
     app.run_polling()
 
